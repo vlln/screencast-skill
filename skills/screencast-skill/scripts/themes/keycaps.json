@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "_comment": "Three kinds of surface: per-key caps (minimal / laptop / lowprofile / pbt, ported from Keyviz), a plain translucent strip with monospace key names (panel, ported from ShowMeTheKey), and the line strip used for typed captions. Colour is a field inside a style, never a style.",
+  "presets": {
+    "minimal": {
+      "mode": "caps",
+      "view": "key",
+      "hold": 2.2,
+      "max_visible": 6,
+      "fill": [
+        70,
+        72,
+        80,
+        255
+      ],
+      "fill2": [
+        26,
+        26,
+        30,
+        255
+      ],
+      "border": [
+        255,
+        255,
+        255,
+        0
+      ],
+      "text": [
+        246,
+        247,
+        251,
+        255
+      ],
+      "style": "minimal",
+      "size": 0.09,
+      "radius": 0.35
+    },
+    "laptop": {
+      "mode": "caps",
+      "view": "key",
+      "hold": 2.2,
+      "max_visible": 6,
+      "fill": [
+        70,
+        72,
+        80,
+        255
+      ],
+      "fill2": [
+        26,
+        26,
+        30,
+        255
+      ],
+      "border": [
+        255,
+        255,
+        255,
+        0
+      ],
+      "text": [
+        246,
+        247,
+        251,
+        255
+      ],
+      "style": "laptop",
+      "size": 0.082,
+      "radius": 0.5
+    },
+    "lowprofile": {
+      "mode": "caps",
+      "view": "key",
+      "hold": 2.2,
+      "max_visible": 6,
+      "fill": [
+        70,
+        72,
+        80,
+        255
+      ],
+      "fill2": [
+        26,
+        26,
+        30,
+        255
+      ],
+      "border": [
+        255,
+        255,
+        255,
+        0
+      ],
+      "text": [
+        246,
+        247,
+        251,
+        255
+      ],
+      "style": "lowprofile",
+      "size": 0.082,
+      "radius": 0.5
+    },
+    "pbt": {
+      "mode": "caps",
+      "view": "key",
+      "hold": 2.2,
+      "max_visible": 6,
+      "fill": [
+        242,
+        240,
+        234,
+        255
+      ],
+      "fill2": [
+        64,
+        62,
+        58,
+        255
+      ],
+      "border": [
+        255,
+        255,
+        255,
+        0
+      ],
+      "text": [
+        32,
+        32,
+        36,
+        255
+      ],
+      "style": "pbt",
+      "size": 0.078,
+      "radius": 0.4
+    },
+    "ink": {
+      "mode": "line",
+      "view": "text",
+      "line_gap": 1.6,
+      "line_hold": 5.0,
+      "max_rows": 1,
+      "max_chars": 40,
+      "position": "bottom-center",
+      "size": 0.105,
+      "gap": 0.35,
+      "radius": 0.26,
+      "margin": 0.1,
+      "fill": [
+        30,
+        33,
+        41,
+        255
+      ],
+      "border": [
+        255,
+        255,
+        255,
+        58
+      ],
+      "text": [
+        238,
+        241,
+        248,
+        255
+      ]
+    },
+    "paper": {
+      "mode": "line",
+      "view": "text",
+      "line_gap": 1.6,
+      "line_hold": 5.0,
+      "max_rows": 1,
+      "max_chars": 40,
+      "position": "bottom-center",
+      "size": 0.105,
+      "gap": 0.35,
+      "radius": 0.26,
+      "margin": 0.1,
+      "fill": [
+        238,
+        236,
+        230,
+        255
+      ],
+      "border": [
+        24,
+        24,
+        28,
+        96
+      ],
+      "text": [
+        28,
+        28,
+        32,
+        255
+      ]
+    },
+    "panel": {
+      "mode": "panel",
+      "view": "text",
+      "size": 0.052,
+      "hold": 1.6,
+      "max_visible": 5,
+      "radius": 0.5,
+      "margin": 0.09,
+      "fill": [
+        0,
+        0,
+        0,
+        110
+      ],
+      "text": [
+        255,
+        255,
+        255,
+        255
+      ]
+    }
+  }
+}

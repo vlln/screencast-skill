@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "background": {
+    "type": "gradient",
+    "top": "#111827",
+    "bottom": "#1f2937",
+    "color": "#111827",
+    "pad": 0,
+    "radius": 16,
+    "shadow": true
+  },
+  "camera": {
+    "zoom": 1.25,
+    "smoothing": 22.0,
+    "follow_cursor": true,
+    "safe_zone": 0.35,
+    "follow_omega": 5.0,
+    "min_move_interval": 0.3,
+    "pad_pre": 0.25,
+    "pad_post": 1.6,
+    "min_duration": 2.0,
+    "center_bias": 0.25
+  },
+  "cursor": {
+    "size": 40,
+    "dark": true,
+    "assets": "assets/cursors/meta.json",
+    "scale_with_zoom": "partial",
+    "zoom_factor": 0.35
+  },
+  "keycap": {
+    "position": "bottom-center",
+    "max_visible": 3,
+    "hold": 1.7,
+    "size": 0.062,
+    "gap": 0.35,
+    "pad_x": 0.52,
+    "pad_y": 0.34,
+    "radius": 0.3,
+    "fill": [
+      24,
+      24,
+      28,
+      235
+    ],
+    "border": [
+      255,
+      255,
+      255,
+      52
+    ],
+    "text": [
+      248,
+      248,
+      252,
+      255
+    ],
+    "margin": 0.12,
+    "mode": "line",
+    "line_gap": 1.6,
+    "line_hold": 2.6,
+    "max_rows": 3,
+    "max_chars": 32
+  },
+  "ripple": {
+    "duration": 0.62,
+    "radius_from": 14.0,
+    "radius_to": 66.0,
+    "thickness": 3.0,
+    "dark": [
+      28,
+      28,
+      34
+    ],
+    "light": [
+      255,
+      255,
+      255
+    ],
+    "dark_alpha": 0.55,
+    "press_scale": 0.88,
+    "press_time": 0.18
+  }
+}

@@ -1,0 +1,16 @@
+# recorded takes never belong in the repo
+screencast-skill-data/
+
+# python runtime, wherever it is created
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# cursor PNGs are generated from the local machine's system artwork, not shipped
+skills/screencast-skill/scripts/assets/cursors/*.png
+
+# macOS
+.DS_Store
+
+# generated cursor atlas (paths and fingerprints point at this machine)
+skills/screencast-skill/scripts/assets/cursors/meta.json

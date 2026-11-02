@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""rec — portable macOS screen recorder with Recordly-style polish.
+
+Design rule: **capture is dumb, rendering is smart.**
+
+  capture  ffmpeg/avfoundation, full display, OS cursor excluded
+  events   sclib.events — pure-python CGEventTap -> JSONL (no compiler needed)
+  render   sclib.render — numpy+Pillow, re-draws cursor / ripples / keycaps / camera
+
+Because effects live *after* the capture, one recording can be re-rendered many ways
+without recording again, and no effect ever has to be injected into the machine
+being filmed.
+
+  rec doctor                      verify deps + permissions, print exact fixes
+  rec list [--json]               list recordings under the data home
+  rec windows [--json]            list capturable windows
+  rec start [--window ID|front]   begin a recording in the background
+  rec stop                        stop it, write meta.json
+  rec run --duration N            start + wait + stop
+  rec run --script F              start + drive(F) + stop, atomically
+  rec plan SESSION [opts]         derive/refresh SESSION/plan.json (editable)
+  rec render SESSION [opts]       execute the plan -> SESSION/out.mp4
+  rec sheet VIDEO [--times ...]   labelled contact sheet (verification)
+  rec styles                      contact sheet of every cursor / keycap style
+"""
+
+import argparse
+import json
+import re
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+# Where recordings are written. Resolved at runtime, in priority order, and the
+# first WRITABLE candidate wins:
+#
+#   1. $REC_HOME            explicit override (per machine / per project)
+#   2. ~/Movies/screencast-skill   the conventional home on macOS
+#   3. ./screencast-skill-data     the agent's own working directory
+#
+# User data never lives inside the skill directory: an installed skill may be
+# read-only, shared between users, or under version control.
+_HOME_CACHE = {}
+# Popen handles for the recording, so `run` can poll() them instead of probing with
+# kill(pid, 0) — which succeeds for a zombie and made every stop wait the full
+# timeout for a child that had already finished.
+_CHILDREN = {}
+
+
+def _alive(pid):
+    for proc in _CHILDREN.values():
+        if proc is not None and proc.pid == pid:
+            return proc.poll() is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _writable_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".rec-write-test-%d" % os.getpid())
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def data_home(force=False):
+    """(path, source) — first writable candidate, cached for the process."""
+    if not force and "v" in _HOME_CACHE:
+        return _HOME_CACHE["v"]
+    cands = []
+    env = os.environ.get("REC_HOME")
+    if env:
+        cands.append((os.path.abspath(os.path.expanduser(env)), "REC_HOME"))
+    # Project first, home second: recordings belong next to the work that made
+    # them, and ~/Movies is a place nobody thinks to look.
+    cands.append((os.path.join(os.getcwd(), "screencast-skill-data"), "cwd"))
+    cands.append((os.path.join(os.path.expanduser("~"), "Movies", "screencast-skill"),
+                  "home"))
+
+    chosen = None
+    for path, why in cands:
+        if _writable_dir(os.path.join(path, "captures")):
+            chosen = (path, why)
+            break
+    if chosen is None:
+        chosen = (cands[-1][0], "unwritable")
+
+    if env and chosen[1] != "REC_HOME":
+        sys.stderr.write("rec: REC_HOME=%s is not writable, using %s\n"
+                         % (env, chosen[0]))
+    elif chosen[1] == "home":
+        sys.stderr.write("rec: %s is not writable, writing recordings under %s "
+                         "(set REC_HOME to move them)\n"
+                         % (os.path.join(os.getcwd(), "screencast-skill-data"),
+                            chosen[0]))
+    _HOME_CACHE["v"] = chosen
+    return chosen
+
+
+def captures_root():
+    return os.path.join(data_home()[0], "captures")
+sys.path.insert(0, ROOT)
+from sclib import backends                      # noqa: E402
+BACKEND = backends.current
+STATE_PATH = "/tmp/recd-current.json"
+FFMPEG = os.environ.get("REC_FFMPEG") or "ffmpeg"
+FFPROBE = os.environ.get("REC_FFPROBE") or "ffprobe"
+MIN_PY = (3, 10)
+
+
+def _env():
+    e = dict(os.environ)
+    e["PYTHONPATH"] = ROOT + (os.pathsep + e["PYTHONPATH"] if e.get("PYTHONPATH") else "")
+    return e
+
+
+# --------------------------------------------------------------------------
+# display / window introspection
+# --------------------------------------------------------------------------
+def display_info(display_index=0):
+    return BACKEND.display_info(display_index)
+
+
+def list_windows():
+    return BACKEND.list_windows()
+
+
+def resolve_window(spec):
+    wins = list_windows()
+    if spec == "front":
+        if not wins:
+            raise SystemExit("no on-screen windows")
+        return wins[0]
+    try:
+        wid = int(spec)
+        for w in wins:
+            if w["id"] == wid:
+                return w
+        return {"id": wid, "owner": "?", "name": "?", "rect": [0, 0, 0, 0]}
+    except ValueError:
+        low = spec.lower()
+        for w in wins:
+            if low in w["owner"].lower() or low in w["name"].lower():
+                return w
+    raise SystemExit("no window matching %r" % spec)
+
+
+# --------------------------------------------------------------------------
+# capture
+# --------------------------------------------------------------------------
+def _read_lines(pipe, on_line):
+    for raw in iter(pipe.readline, b""):
+        on_line(raw.decode("utf-8", "replace"))
+
+
+def probe_video(path):
+    out = subprocess.check_output(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,avg_frame_rate",
+         "-show_entries", "format=duration", "-of", "json", path])
+    j = json.loads(out)
+    st = j["streams"][0]
+    num, den = st["avg_frame_rate"].split("/")
+    fps = float(num) / float(den) if float(den) else 30.0
+    return float(j["format"]["duration"]), int(st["width"]), int(st["height"]), fps
+
+
+def resolve_audio(spec):
+    """Platform-specific: how --audio maps to a capture device."""
+    return BACKEND.resolve_audio(FFMPEG, spec)
+
+
+def _quiet(args):
+    return bool(getattr(args, "quiet", False)) or bool(os.environ.get("REC_QUIET"))
+
+
+def _hud(args, *argv, **kw):
+    """Spawn the on-screen cue. Never let a missing window server stop a recording."""
+    if _quiet(args):
+        return
+    try:
+        p = subprocess.Popen([sys.executable, "-m", "sclib.hud"] + list(argv),
+                             cwd=ROOT, env=_env(),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
+    if kw.get("wait"):
+        try:
+            p.wait(20)
+        except Exception:
+            p.kill()
+
+
+def _ime(*argv, **kw):
+    """Run the input-source helper in a subprocess. Never block a recording on it."""
+    if getattr(kw.get("args"), "no_ime", False) or os.environ.get("REC_NO_IME_SWITCH"):
+        return None
+    try:
+        r = subprocess.run([sys.executable, "-m", "sclib.imeswitch"] + list(argv),
+                           cwd=ROOT, env=_env(), capture_output=True, text=True,
+                           timeout=6)
+    except Exception:
+        return None
+    return (r.stdout or "").strip() or None
+
+
+def _countdown(args):
+    sec = float(getattr(args, "countdown", 0) or 0)
+    if sec <= 0:
+        return
+    _dbg("countdown %.1fs" % sec)
+    _hud(args, "countdown", "%.2f" % sec, wait=True)
+    # the HUD process is gone, but give the window server a beat to drop the
+    # window so it cannot land in frame 1
+    time.sleep(0.18)
+
+
+def cmd_start(args):
+    T0 = time.time()
+    if os.path.exists(STATE_PATH):
+        raise SystemExit("a recording is already running (run `rec stop` first)")
+
+    args.audio = resolve_audio(getattr(args, "audio", None))
+    disp = display_info(args.display)
+    target, win, pin = "screen", None, 0
+    if args.window:
+        win = resolve_window(args.window)
+        pin, target = win["id"], "window"
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    sess = os.path.abspath(args.out or os.path.join(captures_root(), "%s-%s" % (stamp, target)))
+    try:
+        os.makedirs(sess, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(
+            "cannot create session directory %s: %s\n"
+            "Set REC_HOME to a writable location, e.g.\n"
+            "    export REC_HOME=$HOME/Recordings/screencast-skill" % (sess, e))
+    evpath = os.path.join(sess, "events.jsonl")
+    vidpath = os.path.join(sess, "raw.mov")
+
+    _countdown(args)
+
+    tap = subprocess.Popen(
+        [sys.executable, "-m", BACKEND.events_module(), evpath, "--pin", str(pin)],
+        cwd=ROOT, env=_env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    ready = threading.Event()
+
+    def tap_lines(line):
+        if "TAP READY" in line:
+            ready.set()
+        elif line.strip():
+            sys.stderr.write("[events] " + line)
+
+    threading.Thread(target=_read_lines, args=(tap.stderr, tap_lines), daemon=True).start()
+    if not ready.wait(10.0):
+        tap.kill()
+        raise SystemExit("event recorder failed to start — run `rec doctor`")
+    _CHILDREN["tap"] = tap
+    _dbg("event recorder ready", T0)
+
+    inputs = BACKEND.capture_inputs(args.fps, args.display, args.audio, win)
+    ff = [FFMPEG, "-hide_banner", "-loglevel", "info", "-y"]
+    for inp in inputs:
+        ff += inp
+    ff += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
+           "-pix_fmt", "yuv420p", "-r", str(args.fps)]
+    # Let ffmpeg stop itself when the length is known: SIGINT teardown keeps
+    # capturing for seconds afterwards, so a "1s recording" would come out at ~4s.
+    limit = getattr(args, "duration_limit", None)
+    if limit:
+        ff += ["-t", "%.3f" % float(limit)]
+    if args.audio:
+        ff += ["-c:a", "aac", "-b:a", "192k"]
+    ff += [vidpath]
+
+    ffp = subprocess.Popen(ff, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE)
+    video_start = [None]
+
+    def ff_lines(line):
+        if video_start[0] is None and "Press [q] to stop" in line:
+            video_start[0] = time.time()
+
+    threading.Thread(target=_read_lines, args=(ffp.stderr, ff_lines), daemon=True).start()
+    for _ in range(120):
+        if video_start[0] is not None:
+            break
+        time.sleep(0.05)
+
+    _CHILDREN["ffmpeg"] = ffp
+    _dbg("capture rolling", T0)
+    state = {"session": sess, "video": vidpath, "events": evpath,
+             "tap_pid": tap.pid, "ffmpeg_pid": ffp.pid, "started": time.time(),
+             "fps": args.fps, "display": disp, "target": target, "window": win,
+             "limit": limit, "self_stop": bool(getattr(args, "self_stop", False))}
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+    print(sess)
+    return 0
+
+
+def _read_tap_wall(evpath):
+    for _ in range(60):
+        try:
+            with open(evpath) as f:
+                for line in f:
+                    e = json.loads(line)
+                    if e.get("type") == "start":
+                        return e.get("wall")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        time.sleep(0.05)
+    return None
+
+
+def _dbg(msg, t0=None):
+    if os.environ.get("REC_DEBUG"):
+        import time as _t
+        suffix = "" if t0 is None else "  (+%.2fs)" % (_t.time() - t0)
+        sys.stderr.write("[rec] %s%s\n" % (msg, suffix))
+
+
+def _wait_exit(pid, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _terminate(pid, sig, timeout, hard=None):
+    """Signal a child and wait for it, escalating if it ignores us."""
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    if hard is not None:
+        try:
+            os.kill(pid, hard)
+        except ProcessLookupError:
+            return True
+        for _ in range(40):
+            if not _alive(pid):
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def cmd_stop(args):
+    if not os.path.exists(STATE_PATH):
+        raise SystemExit("no recording is running")
+    state = json.load(open(STATE_PATH))
+
+    # Stop the event tap first: it is cheap and has no state to flush. ffmpeg
+    # can take ~10s to finalise after SIGINT, and waiting for it first left the
+    # tap running (and recording) for that whole time.
+    T1 = time.time()
+    _terminate(state["tap_pid"], signal.SIGTERM, 2.0)
+    _dbg("tap stopped", T1)
+
+    if state.get("self_stop"):
+        # ffmpeg reached its own `-t` and is finalising; SIGINT here would only
+        # block while it keeps capturing.
+        if not _wait_exit(state["ffmpeg_pid"], 6.0):
+            _terminate(state["ffmpeg_pid"], signal.SIGKILL, 2.0)
+    else:
+        # unknown length: ask it to quit, SIGKILL only as a last resort
+        _terminate(state["ffmpeg_pid"], signal.SIGINT, 12.0, hard=signal.SIGKILL)
+
+    _dbg("ffmpeg stopped", T1)
+    tap_wall = _read_tap_wall(state["events"])
+    dur, w, h, fr = probe_video(state["video"])
+    meta = dict(state)
+    meta.update({"width": w, "height": h, "probe_fps": fr, "duration": dur,
+                 "tap_wall": tap_wall,
+                 "sync_offset": (state["started"] - tap_wall) if tap_wall else 0.0})
+    with open(os.path.join(state["session"], "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    os.remove(STATE_PATH)
+
+    # Report the facts, nothing else. "that recording looks too short" is a judgement
+    # about intent, and a capture tool does not know the intent.
+    size_mb = os.path.getsize(state["video"]) / (1024.0 * 1024.0)
+    _hud(args, "note", "%.1fs · %.1f MB" % (dur, size_mb),
+         os.path.basename(state["session"]))
+    print(json.dumps({k: meta[k] for k in
+                      ("session", "width", "height", "duration", "target",
+                       "sync_offset")}, indent=2))
+    return 0
+
+
+def cmd_run(args):
+    """Capture + drive + stop atomically.
+
+    Splitting `start` and the input script across separate invocations leaks
+    operator latency into the recording — the action then lands wherever the footage
+    happens to be by the time it runs.
+    """
+    script = getattr(args, "script", None)
+    if not script:
+        # known length: ffmpeg stops itself, so `stop` just waits for it
+        args.duration_limit = float(args.duration)
+        args.self_stop = True
+    else:
+        # unknown length: `-t` is only a runaway cap; the script's end decides,
+        # so ffmpeg still has to be told to quit (SIGINT) to finalise properly
+        args.duration_limit = float(getattr(args, "lead", 0.8)) + 600.0
+        args.self_stop = False
+    cmd_start(args)
+    try:
+        time.sleep(getattr(args, "lead", 0.8))
+        if script:
+            # A live Chinese IME eats injected ASCII into its composition
+            # buffer. Park the keyboard on a plain layout for the duration of
+            # the script, then put the operator's own source back.
+            ime_saved = _ime("ascii", args=args)
+            try:
+                with open(script) as f:
+                    r = subprocess.run([sys.executable, "-m", BACKEND.drive_module()],
+                                       stdin=f, cwd=ROOT, env=_env())
+                if r.returncode:
+                    sys.stderr.write("rec: drive exited %d -- the recording is short, "
+                                     "check the `expect` guard\n" % r.returncode)
+            finally:
+                if ime_saved and ime_saved != "none":
+                    _ime("select", ime_saved, args=args)
+            time.sleep(getattr(args, "tail", 0.8))
+        else:
+            deadline = time.time() + args.duration
+            while time.time() < deadline:
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    return cmd_stop(args)
+
+
+# --------------------------------------------------------------------------
+# render / sheet
+# --------------------------------------------------------------------------
+def load_theme(path):
+    if not path:
+        default = os.path.join(ROOT, "themes", "default.json")
+        path = default if os.path.exists(default) else None
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        raise SystemExit("cannot read theme %s: %s" % (path, e))
+
+
+def _bg_presets():
+    try:
+        with open(os.path.join(ROOT, "themes", "backgrounds.json")) as f:
+            return json.load(f).get("presets") or {}
+    except Exception:
+        return {}
+
+
+def _keycap_presets():
+    try:
+        with open(os.path.join(ROOT, "themes", "keycaps.json")) as f:
+            return json.load(f).get("presets") or {}
+    except Exception:
+        return {}
+
+
+def cmd_render(args):
+    theme = load_theme(getattr(args, "theme", None))
+    name = getattr(args, "keycap_preset", None)
+    if name:
+        presets = _keycap_presets()
+        if name not in presets:
+            raise SystemExit("unknown keycap preset %r (have: %s)"
+                             % (name, ", ".join(sorted(presets))))
+        theme = dict(theme)
+        theme["keycap"] = dict(theme.get("keycap") or {}, **presets[name])
+    bg_name = getattr(args, "bg_preset", None)
+    if bg_name:
+        presets = _bg_presets()
+        if bg_name not in presets:
+            raise SystemExit("unknown background preset %r (have: %s)"
+                             % (bg_name, ", ".join(sorted(presets))))
+        theme = dict(theme)
+        theme["background"] = dict(theme.get("background") or {},
+                                   **presets[bg_name])
+    view = getattr(args, "keycap_view", None)
+    if view:
+        theme = dict(theme)
+        theme["keycap"] = dict(theme.get("keycap") or {}, view=view)
+    args.theme_data = theme
+    args.zoom_override = args.zoom
+    if args.cursor_size is None:
+        args.cursor_size = float((theme.get("cursor") or {}).get("size", 40))
+    sys.path.insert(0, ROOT)
+    from sclib import render
+    return render.render_session(args)
+
+
+def cmd_styles(args):
+    """Render a contact sheet of every built-in cursor and keycap style."""
+    sys.path.insert(0, ROOT)
+    from sclib import styles
+    out = args.out or os.path.join(data_home()[0], "styles.png")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    styles.build_sheet(styles.load_presets(ROOT), out)
+    print(out)
+    return 0
+
+
+def cmd_plan(args):
+    """Derive (or re-derive) plan.json from the recorded facts."""
+    theme = load_theme(getattr(args, "theme", None))
+    sys.path.insert(0, ROOT)
+    from sclib import plan as plan_mod
+    p = plan_mod.build_plan(args.session, theme, args.zoom)
+    out = args.out or os.path.join(args.session, "plan.json")
+    plan_mod.save(p, out)
+    print(out)
+    return 0
+
+
+def cmd_sheet(args):
+    from PIL import Image, ImageDraw, ImageFont
+    dur, W, H = probe_video(args.video)[:3]
+    if args.times:
+        times = [float(t) for t in args.times.split(",")]
+    else:
+        step = 1.0 / max(args.fps, 0.01)
+        times = [i * step for i in range(int(dur / step))][: args.cols * args.rows]
+    cols = args.cols
+    rows = (len(times) + cols - 1) // cols
+    tw = args.width
+    th = max(2, int(round(tw * H / W)))
+    label_h = 22
+    sheet = Image.new("RGB", (cols * tw, rows * (th + label_h)), (18, 18, 20))
+    d = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/SFNSMono.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+    for i, t in enumerate(times):
+        f = "/tmp/_sheetframe_%d_%d.png" % (os.getpid(), i)
+        subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", "%.4f" % t, "-i", args.video, "-frames:v", "1",
+                        "-vf", "scale=%d:-1" % tw, f], check=True)
+        img = Image.open(f).convert("RGB").resize((tw, th), Image.LANCZOS)
+        os.remove(f)
+        cx, cy = (i % cols) * tw, (i // cols) * (th + label_h)
+        sheet.paste(img, (cx, cy + label_h))
+        d.text((cx + 6, cy + 4), "t=%.2fs" % t, font=font, fill=(230, 230, 235))
+    if args.out:
+        out = args.out
+    else:
+        vdir = os.path.dirname(os.path.abspath(args.video))
+        if os.path.exists(os.path.join(vdir, "meta.json")):
+            out = os.path.join(vdir, "sheets",
+                               os.path.splitext(os.path.basename(args.video))[0] + ".png")
+        else:
+            out = os.path.splitext(args.video)[0] + "-sheet.png"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    sheet.save(out)
+    print(out)
+    return 0
+
+
+def cmd_windows(args):
+    wins = list_windows()
+    if getattr(args, "json", False):
+        print(json.dumps(wins, indent=2))
+        return 0
+    for w in wins:
+        print("%-7d %-22s %6.0f,%-5.0f %5.0fx%-5.0f %s" % (
+            w["id"], w["owner"][:22], w["rect"][0], w["rect"][1],
+            w["rect"][2], w["rect"][3], w["name"][:40]))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# doctor — the guided install path for a fresh machine
+# --------------------------------------------------------------------------
+def shutil_which(binary):
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        c = os.path.join(p, binary)
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _avf_devices():
+    devs = subprocess.run([FFMPEG, "-hide_banner", "-f", "avfoundation",
+                           "-list_devices", "true", "-i", ""],
+                          capture_output=True, text=True).stderr
+    screens, audios, seen_audio = [], [], False
+    for ln in devs.splitlines():
+        low = ln.lower()
+        if "audio devices" in low:
+            seen_audio = True
+            continue
+        if "video devices" in low:
+            seen_audio = False
+            continue
+        m = re.search(r"\]\s*\[(\d+)\]\s+(.+)$", ln)
+        if not m:
+            continue
+        (audios if seen_audio else screens).append(m.group(2).strip())
+    return screens, audios
+
+
+def cmd_cursors(args):
+    sys.path.insert(0, ROOT)
+    from sclib import cursors
+    out = getattr(args, "out", None) or os.path.join(ROOT, "assets", "cursors")
+    if getattr(args, "import_dir", None):
+        path, meta = cursors.import_pngs(args.import_dir, out)
+        print(path)
+        for k, v in meta.items():
+            print("  %-12s %s  hotspot=%s" % (k, v["path"], v["hotspot"]))
+        if not meta:
+            print("no recognizable cursor PNGs — see references/CURSORS.md")
+        return 0
+    # Prefer Apple's own vector cursors; fall back to NSCursor's bitmaps for
+    # anything the resource bundle does not ship.
+    path, meta = cursors.export_system(out)
+    if not meta:
+        path, meta = cursors.export(out)
+    print(path)
+    for k, v in meta.items():
+        print("  %-12s %s" % (k, os.path.basename(v["path"])))
+    missing = [k for k in cursors.CURSORS if k not in meta]
+    if missing:
+        print("\nnot exportable via pyobjc (use your own PNG in theme cursor.assets): %s"
+              % ", ".join(missing))
+    return 0
+
+
+def cmd_list(args):
+    """Enumerate recordings under the data home (agent-friendly inventory)."""
+    root = args.root or captures_root()
+    if not os.path.isdir(root):
+        print("no recordings yet — recordings root: %s" % root)
+        return 0
+    rows = []
+    for name in sorted(os.listdir(root), reverse=True):
+        d = os.path.join(root, name)
+        meta_path = os.path.join(d, "meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            m = json.load(open(meta_path))
+        except Exception:
+            continue
+        size = 0
+        for dirpath, _dirs, files in os.walk(d):
+            for fn in files:
+                try:
+                    size += os.path.getsize(os.path.join(dirpath, fn))
+                except OSError:
+                    pass
+        rows.append({
+            "session": name,
+            "duration": round(float(m.get("duration", 0)), 2),
+            "target": m.get("target", "?"),
+            "size_mb": round(size / 1048576.0, 1),
+            "plan": os.path.exists(os.path.join(d, "plan.json")),
+            "rendered": os.path.exists(os.path.join(d, "out.mp4")),
+        })
+    if getattr(args, "json", False):
+        print(json.dumps({"root": root, "sessions": rows}, indent=2))
+        return 0
+    if not rows:
+        print("no recordings yet — recordings root: %s" % root)
+        return 0
+    print("recordings in: %s\n" % root)
+    print("%-28s %6s %-8s %8s  %-5s %s" % ("session", "dur", "target", "size", "plan", "render"))
+    for r in rows:
+        print("%-28s %5.1fs %-8s %7.1fM  %-5s %s"
+              % (r["session"], r["duration"], r["target"], r["size_mb"],
+                 "yes" if r["plan"] else "-", "yes" if r["rendered"] else "-"))
+    return 0
+
+
+def cmd_doctor(args):
+    ok = True
+    problems = []
+
+    print("platform   %s  (backend=%s, capture=%s)"
+          % (sys.platform, BACKEND.NAME, BACKEND.CAPTURE_IMPL or "?"))
+    home, why = data_home(force=True)
+    writable = why != "unwritable"
+    print("data home  %s  [%s]%s" % (home, why, "" if writable else "  NOT WRITABLE"))
+    if os.environ.get("REC_HOME"):
+        print("           REC_HOME=%s" % os.environ["REC_HOME"])
+    if not writable:
+        ok = False
+        problems.append("no writable data home — set REC_HOME to a writable dir")
+
+    legacy = os.path.join(ROOT, "captures")
+    try:
+        if os.path.isdir(legacy) and os.listdir(legacy):
+            print("legacy     %s still holds old recordings" % legacy)
+            print("           move them:  mv \"%s\"/* \"%s\"/"
+                  % (legacy, captures_root()))
+    except OSError:
+        pass
+
+    v = sys.version_info
+    py_ok = v[:2] >= MIN_PY
+    print("python     %d.%d.%d %s" % (v[0], v[1], v[2],
+          "ok" if py_ok else "TOO OLD (need >= %d.%d)" % MIN_PY))
+    if not py_ok:
+        ok = False
+        problems.append(
+            "Python too old — pyobjc ships no wheels for it, so `pip install` "
+            "fails trying to compile from source. Use Python 3.12:\n"
+            "        brew install uv && uv venv .venv --python 3.12")
+
+    need = [("Quartz", "pyobjc-framework-Quartz"), ("numpy", "numpy"), ("PIL", "Pillow")]
+    if BACKEND.NAME == "windows":
+        need = [("numpy", "numpy"), ("PIL", "Pillow"), ("pynput", "pynput")]
+    for mod, pip_name in need:
+        try:
+            __import__(mod)
+            print("%-10s ok" % (mod + ":"))
+        except Exception:
+            ok = False
+            print("%-10s MISSING" % (mod + ":"))
+            problems.append("missing module — uv pip install %s" % pip_name)
+
+    # Import the input/event modules for real: a syntax-level mistake in either
+    # one used to surface only as "the demo silently typed nothing".
+    for modname in (BACKEND.drive_module(), BACKEND.events_module()):
+        try:
+            __import__(modname.split(".")[0] + "." + modname.split(".")[-1])
+            print("%-10s ok" % (modname + ":"))
+        except Exception as e:
+            ok = False
+            print("%-10s BROKEN  %s" % (modname + ":", e))
+            problems.append("%s does not import — recording will run but type "
+                            "nothing: %s" % (modname, e))
+
+    if BACKEND.NAME == "darwin":
+        try:
+            from AppKit import NSSound  # noqa: F401
+            print("hud:       ok (countdown + completion cue)")
+        except Exception:
+            print("hud:       unavailable (no AppKit) — cues fall back to text")
+
+    for tool in (FFMPEG, FFPROBE):
+        found = shutil_which(tool) is not None
+        print("%-10s %s" % (tool + ":", "ok" if found else "MISSING"))
+        if not found:
+            ok = False
+            problems.append("ffmpeg missing — brew install ffmpeg"
+                            if BACKEND.NAME == "macos"
+                            else "ffmpeg missing — winget install Gyan.FFmpeg")
+
+    try:
+        d = display_info()
+        print("display    id=%s points=%s pixels=%s scale=%s"
+              % (d["display_id"], d["points"], d["pixels"], d["scale"]))
+    except Exception as e:
+        print("display    ERROR %s" % e)
+        ok = False
+
+    try:
+        perms_ok, checks, hints = BACKEND.permissions()
+        for k, v2 in checks.items():
+            print("%-10s %s" % (k[:9] + ":", "granted" if v2 else
+                                ("n/a" if v2 is None else "DENIED")))
+        if not perms_ok:
+            ok = False
+            problems.extend(hints)
+    except Exception as e:
+        print("perms      ERROR %s" % e)
+
+    if shutil_which(FFMPEG):
+        try:
+            screens, audios = BACKEND.audio_devices(FFMPEG)
+            print("capture    %s" % ("; ".join(screens) or "NONE"))
+            print("audio      %s" % ("; ".join(audios) or "NONE"))
+            if not screens:
+                ok = False
+                problems.append("no capture device found")
+            if not audios:
+                print("           (no mic or loopback found — desktop Macs "
+                      "such as Mac Studio have no built-in microphone)")
+            elif not any("mic" in a.lower() for a in audios):
+                print("           (no obvious microphone; for system audio see "
+                      "SKILL.md -> 音频)")
+        except Exception as e:
+            print("capture    ERROR %s" % e)
+
+    if BACKEND.NAME == "windows":
+        print("note       Windows input capture is UNVERIFIED — report what "
+              "`rec doctor` shows if something fails")
+    if problems:
+        print("\nTO FIX:")
+        for pb in problems:
+            print("  - " + pb)
+    print("\n" + ("READY" if ok else "NOT READY"))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="rec", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def cap(sp):
+        sp.add_argument("--window", default=None,
+                        help="ID, 'front', or owner/name substring")
+        sp.add_argument("--fps", type=int, default=30)
+        sp.add_argument("--out", default=None)
+        sp.add_argument("--display", type=int, default=0)
+        sp.add_argument("--device", default="0")
+        sp.add_argument("--audio", default=None,
+                        help="audio source: an avfoundation index, a name "
+                             "substring, or 'mic' / 'system'")
+        sp.add_argument("--countdown", type=float, default=3.0,
+                        help="on-screen countdown before capture starts "
+                             "(default 3, 0 disables)")
+        sp.add_argument("--quiet", action="store_true",
+                        help="no countdown, no completion cue, no sounds")
+        sp.add_argument("--no-ime", action="store_true",
+                        help="do not switch the input source around --script "
+                             "(REC_NO_IME_SWITCH=1 also works)")
+        return sp
+
+    cap(sub.add_parser("start"))
+    cap(sub.add_parser("stop"))
+    # `stop` is a teardown path: counting down before a teardown would be absurd
+    st = sub.choices["stop"]
+    st.set_defaults(countdown=0.0)
+    r = cap(sub.add_parser("run"))
+    r.add_argument("--duration", type=float, default=5.0)
+    r.add_argument("--script", default=None)
+    r.add_argument("--lead", type=float, default=0.8)
+    r.add_argument("--tail", type=float, default=0.8)
+
+    rd = sub.add_parser("render")
+    rd.add_argument("session")
+    rd.add_argument("--out", default=None)
+    rd.add_argument("--theme", default=None)
+    rd.add_argument("--zoom", type=float, default=None)
+    rd.add_argument("--no-zoom", action="store_true")
+    rd.add_argument("--no-cursor", action="store_true")
+    rd.add_argument("--no-keys", action="store_true")
+    rd.add_argument("--cursor-size", type=float, default=None)
+    rd.add_argument("--pad", type=int, default=None)
+    rd.add_argument("--radius", type=int, default=None)
+    rd.add_argument("--bg", default=None)
+    rd.add_argument("--fps", type=int, default=0)
+    rd.add_argument("--plan", default=None,
+                    help="plan.json to execute (default: SESSION/plan.json)")
+    rd.add_argument("--rebuild-plan", action="store_true",
+                    help="ignore an existing plan.json and re-derive it")
+    rd.add_argument("--smooth", type=float, default=None,
+                    help="cursor spring omega (higher = tighter)")
+    rd.add_argument("--keycap-preset", default=None,
+                    help="named style from themes/keycaps.json")
+    rd.add_argument("--bg-preset", default=None,
+                    help="named background from themes/backgrounds.json")
+    rd.add_argument("--keycap-view", default=None, choices=["text", "key"],
+                    help="'text' shows what the app received (Chinese as "
+                         "Chinese); 'key' shows the physical keys")
+
+    pl = sub.add_parser("plan", help="derive plan.json from a session")
+    pl.add_argument("session")
+    pl.add_argument("--out", default=None)
+    pl.add_argument("--theme", default=None)
+    pl.add_argument("--zoom", type=float, default=None)
+
+    ls = sub.add_parser("list", help="list recordings under the data home")
+    ls.add_argument("--root", default=None)
+    ls.add_argument("--json", action="store_true")
+
+    cu = sub.add_parser("cursors",
+                        help="export macOS system cursors, or import a PNG set")
+    cu.add_argument("--import", dest="import_dir", default=None,
+                    help="directory of cursor PNGs to adopt (see references/CURSORS.md)")
+    cu.add_argument("--out", default=None, help="output directory")
+
+    st = sub.add_parser("styles",
+                        help="contact sheet of every cursor / keycap style")
+    st.add_argument("--out", default=None)
+
+    sub.add_parser("doctor")
+    w = sub.add_parser("windows")
+    w.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("sheet")
+    s.add_argument("video")
+    s.add_argument("--times", default=None)
+    s.add_argument("--fps", type=float, default=1.0)
+    s.add_argument("--cols", type=int, default=3)
+    s.add_argument("--rows", type=int, default=3)
+    s.add_argument("--width", type=int, default=640)
+    s.add_argument("--out", default=None)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return {"start": cmd_start, "stop": cmd_stop, "run": cmd_run,
+            "render": cmd_render, "sheet": cmd_sheet, "plan": cmd_plan,
+            "cursors": cmd_cursors, "list": cmd_list, "styles": cmd_styles,
+            "doctor": cmd_doctor, "windows": cmd_windows}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

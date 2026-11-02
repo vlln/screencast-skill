@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "_comment": "README demo. Clicks are real, so the auto-focus engine zooms on its own; the timeline only changes the overlay surfaces.",
+  "background": {
+    "type": "gradient",
+    "stops": [
+      {
+        "at": 0.0,
+        "color": "#090f1c"
+      },
+      {
+        "at": 0.55,
+        "color": "#152a45"
+      },
+      {
+        "at": 1.0,
+        "color": "#1f4b73"
+      }
+    ],
+    "angle": 118,
+    "pad": 84,
+    "radius": 22,
+    "vignette": 0.26,
+    "grain": 0.028,
+    "shadow": {
+      "blur": 36,
+      "dy": 22,
+      "alpha": 165
+    }
+  },
+  "camera": {
+    "zoom": 1.45,
+    "smoothing": 22.0,
+    "follow_cursor": true,
+    "safe_zone": 0.35,
+    "follow_omega": 5.0,
+    "min_move_interval": 0.3,
+    "pad_pre": 0.35,
+    "pad_post": 1.8,
+    "min_duration": 2.2,
+    "center_bias": 0.25,
+    "zoom_omega": 3.2
+  },
+  "cursor": {
+    "size": 64,
+    "dark": true,
+    "scale_with_zoom": "partial",
+    "zoom_factor": 0.35,
+    "auto_scale": {
+      "gain": 0.22,
+      "speed_ref": 900.0,
+      "click_pulse": 0.1,
+      "smoothing": 10.0
+    },
+    "smoothing": 28.0
+  },
+  "keycap": {
+    "mode": "line",
+    "view": "text",
+    "line_gap": 1.6,
+    "line_hold": 3.4,
+    "max_rows": 1,
+    "max_chars": 40,
+    "position": "bottom-center",
+    "size": 0.098,
+    "gap": 0.35,
+    "radius": 0.26,
+    "margin": 0.09,
+    "fill": [
+      30,
+      33,
+      41,
+      255
+    ],
+    "border": [
+      255,
+      255,
+      255,
+      58
+    ],
+    "text": [
+      238,
+      241,
+      248,
+      255
+    ]
+  },
+  "ripple": {
+    "duration": 0.7,
+    "radius_from": 16.0,
+    "radius_to": 92.0,
+    "thickness": 4.0,
+    "dark": [
+      28,
+      28,
+      34
+    ],
+    "light": [
+      255,
+      255,
+      255
+    ],
+    "dark_alpha": 0.6,
+    "press_scale": 0.86,
+    "press_time": 0.2
+  },
+  "timeline": [
+    {
+      "_beat": "surface 2: the quiet strip",
+      "t": 6.6,
+      "set": {
+        "keycap": {
+          "mode": "panel",
+          "size": 0.058,
+          "hold": 1.7,
+          "fill": [
+            0,
+            0,
+            0,
+            120
+          ],
+          "text": [
+            255,
+            255,
+            255,
+            255
+          ]
+        }
+      }
+    },
+    {
+      "_beat": "surface 3: real keycaps",
+      "t": 11.9,
+      "set": {
+        "keycap": {
+          "mode": "caps",
+          "view": "key",
+          "style": "lowprofile",
+          "hold": 2.6,
+          "max_visible": 6,
+          "size": 0.08,
+          "fill": [
+            44,
+            46,
+            54,
+            255
+          ],
+          "border": [
+            255,
+            255,
+            255,
+            90
+          ],
+          "text": [
+            246,
+            247,
+            251,
+            255
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "background": {
+    "type": "gradient",
+    "top": "#0b1220",
+    "bottom": "#1e3a5f",
+    "pad": 80,
+    "radius": 22,
+    "shadow": true
+  },
+  "camera": {
+    "zoom": 1.28,
+    "smoothing": 22.0,
+    "follow_cursor": true,
+    "safe_zone": 0.35,
+    "follow_omega": 5.0,
+    "min_move_interval": 0.3,
+    "pad_pre": 0.25,
+    "pad_post": 1.6,
+    "min_duration": 2.0,
+    "center_bias": 0.25
+  },
+  "cursor": {
+    "size": 46,
+    "dark": true,
+    "assets": "assets/cursors/meta.json",
+    "scale_with_zoom": "partial",
+    "zoom_factor": 0.35
+  },
+  "keycap": {
+    "mode": "line",
+    "line_gap": 1.6,
+    "line_hold": 2.8,
+    "max_rows": 2,
+    "max_chars": 40,
+    "position": "bottom-center",
+    "size": 0.105,
+    "gap": 0.35,
+    "radius": 0.3,
+    "margin": 0.1,
+    "fill": [
+      22,
+      26,
+      38,
+      245
+    ],
+    "border": [
+      120,
+      190,
+      255,
+      90
+    ],
+    "text": [
+      230,
+      242,
+      255,
+      255
+    ]
+  }
+}
